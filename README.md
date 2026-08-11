@@ -7,6 +7,8 @@ Every video becomes its own note, with a full description, clickable links to an
 
 **Read [GUIDE.md](GUIDE.md) for a full walkthrough of exactly what this does and how it behaves, prompt by prompt.**
 
+![Workflow overview: Fetch Latest / Ingest / Show Local paths, what each prompt asks, and what gets written where](docs/workflow-infographic.jpeg)
+
 ---
 
 ## What you get
