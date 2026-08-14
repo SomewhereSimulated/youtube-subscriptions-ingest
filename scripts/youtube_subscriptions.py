@@ -63,7 +63,17 @@ per-channel slice is still cheap.
     python youtube_subscriptions.py test
     python youtube_subscriptions.py fetch [--days N] [--max-per-channel N]
     python youtube_subscriptions.py refresh
+    python youtube_subscriptions.py transcript [--limit N]
     python youtube_subscriptions.py ingest [--limit N]
+
+`transcript` is a third phase between fetch and ingest, added 2026-08-14
+(see decisions/log.md) — pulls each raw video's caption track via
+fetch_transcript.py (youtube_transcript_api, cached/throttled/retried
+per-video) and writes it as a sidecar text file next to the raw metadata
+file. A video with captions disabled or region-blocked is recorded as
+"unavailable", not an error — there's no audio-transcription fallback.
+Run `ingest` afterward (or it'll just skip transcripts for videos it
+hasn't fetched yet) to fold available transcripts into wiki/ source pages.
 
 `configure` is a one-time step (per machine/checkout) — no hardcoded path
 to any particular vault or project. `--raw-dir` is where verbatim raw
@@ -127,6 +137,7 @@ TOKEN_PATH = os.path.join(CRED_DIR, "youtube_token.json")
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), ".youtube_subscriptions_config.json")
 RAW_DIR = None
 RAW_INDEX_PATH = None
+TRANSCRIPT_INDEX_PATH = None
 INGEST_INDEX_PATH = None
 SOURCES_DIR = None
 CONCEPTS_DIR = None
@@ -146,7 +157,7 @@ def apply_config():
     """Populates the module-level path globals from the saved config.
     Call this at the top of any command that reads/writes raw/ or wiki/
     (not needed for auth/test/configure)."""
-    global RAW_DIR, RAW_INDEX_PATH, INGEST_INDEX_PATH
+    global RAW_DIR, RAW_INDEX_PATH, TRANSCRIPT_INDEX_PATH, INGEST_INDEX_PATH
     global SOURCES_DIR, CONCEPTS_DIR, ENTITIES_DIR, INDEX_PATH, LOG_PATH
     cfg = load_config()
     if not cfg:
@@ -158,6 +169,7 @@ def apply_config():
     wiki_root = os.path.abspath(cfg["wiki_root"])
     RAW_DIR = raw_dir
     RAW_INDEX_PATH = os.path.join(raw_dir, "_fetch-index.tsv")
+    TRANSCRIPT_INDEX_PATH = os.path.join(raw_dir, "_transcript-index.tsv")
     INGEST_INDEX_PATH = os.path.join(raw_dir, "_ingest-index.tsv")
     SOURCES_DIR = os.path.join(wiki_root, "wiki", "sources", "youtube-videos")
     CONCEPTS_DIR = os.path.join(wiki_root, "wiki", "concepts")
@@ -176,9 +188,8 @@ def cmd_configure(args):
     index_path = os.path.join(wiki_root, "index.md")
     log_path = os.path.join(wiki_root, "log.md")
     # Only scaffold these if genuinely absent — never overwrite an
-    # existing vault's real index.md/log.md (if you're pointing this at an
-    # already-populated Brain-Matter-style vault, it likely has hand-written
-    # content in both).
+    # existing vault's real index.md/log.md (e.g. Jeffrey's Brain Matter
+    # already has hand-written content in both).
     if not os.path.exists(index_path):
         with open(index_path, "w", encoding="utf-8") as f:
             f.write(
@@ -203,6 +214,14 @@ def cmd_configure(args):
         "wiki_root": wiki_root,
         "config_path": CONFIG_PATH,
     }))
+
+# Shared between raw/ files (transcript command appends this section) and
+# wiki/ source pages (ingest writes it) so both stay in the same format —
+# positioned directly after the description in both places.
+TRANSCRIPT_HEADING = "## Transcript"
+# Placeholder written for a video with no captions — excluded from tagging
+# (generate_links) so it never matches a taxonomy keyword by accident.
+TRANSCRIPT_UNAVAILABLE = "_Unavailable (no captions on this video)._"
 
 DEFAULT_FIRST_RUN_DAYS = 90
 # No default per-channel cap — the archive's value is being a comprehensive
@@ -278,7 +297,7 @@ ENTITY_TAXONOMY = {
     "runway": {"name": "Runway", "keywords": ["runway"]},
 }
 
-MAX_CONCEPTS_PER_VIDEO = 6
+MAX_CONCEPTS_PER_VIDEO = 12
 MAX_ENTITIES_PER_VIDEO = 4
 
 
@@ -292,11 +311,22 @@ def match_taxonomy(taxonomy, haystack, max_results):
     return [slug for _, slug in scored[:max_results]]
 
 
-def generate_links(title, description):
+def generate_links(title, description, transcript=None):
     """Returns {"concepts": [slug, ...], "entities": [slug, ...]} — the
     ingest-time equivalent of the old generate_tags(), split by type so
-    each can be filed in the right Brain Matter folder."""
-    haystack = f" {title} {description} ".lower()
+    each can be filed in the right Brain Matter folder.
+
+    Includes transcript text in the match haystack when available (added
+    2026-08-14, decisions/log.md) — verified against a real video first:
+    roughly doubled the number of concepts with any real signal (7 -> 14
+    non-zero hits on that sample) and fixed real misses (a video's actual
+    Lead Generation focus was nearly cut by the old title+description-only
+    haystack, ranked #7 against a cap of 6 — cap raised to 12 alongside
+    this change so genuinely-relevant lower-ranked hits stop getting cut).
+    The unavailable-transcript placeholder is excluded so it can never
+    accidentally match a keyword."""
+    transcript_text = transcript if transcript and transcript != TRANSCRIPT_UNAVAILABLE else ""
+    haystack = f" {title} {description} {transcript_text} ".lower()
     return {
         "concepts": match_taxonomy(CONCEPT_TAXONOMY, haystack, MAX_CONCEPTS_PER_VIDEO),
         "entities": match_taxonomy(ENTITY_TAXONOMY, haystack, MAX_ENTITIES_PER_VIDEO),
@@ -542,8 +572,21 @@ def write_raw_file(video, fetch_date):
         "---\n\n"
     )
     body = f"# {title}\n\n{description}\n"
+
+    # `refresh` rewrites this file in place to pick up updated stats — if
+    # the transcript phase already appended a Transcript section, preserve
+    # it rather than silently wiping it out. Fetch (new file) never hits
+    # this branch since the file doesn't exist yet.
+    transcript_section = ""
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as f:
+            existing = f.read()
+        m = re.search(rf"\n{re.escape(TRANSCRIPT_HEADING)}\n\n.*", existing, re.DOTALL)
+        if m:
+            transcript_section = m.group(0)
+
     with open(path, "w", encoding="utf-8") as f:
-        f.write(frontmatter + body)
+        f.write(frontmatter + body + transcript_section)
     return path
 
 
@@ -733,6 +776,161 @@ def cmd_refresh(args):
 
 
 # ---------------------------------------------------------------------------
+# transcript — raw/**/*.md -> raw/**/*.transcript.txt sidecar files. Third
+# phase, between fetch and ingest. Uses fetch_transcript.py (same folder) —
+# straight YouTube caption-track scrape via youtube_transcript_api, cached
+# and throttled per video, never audio transcription. Added 2026-08-14 from
+# a spec Jeffrey brought back from Ryan Cunningham (AI Automation Society)
+# — see decisions/log.md.
+# ---------------------------------------------------------------------------
+
+TRANSCRIPT_INDEX_HEADER = "video_id\tstatus\tpath\tword_count\tfetched\n"
+# Only these are terminal (never worth retrying) and get written to the
+# index, so a video that errored (e.g. a transient IP block) is naturally
+# retried on the next `transcript` run instead of being silently given up
+# on forever.
+TRANSCRIPT_TERMINAL_STATUSES = {"ok", "cached", "unavailable"}
+
+
+def read_transcript_index_rows():
+    if not os.path.exists(TRANSCRIPT_INDEX_PATH):
+        return []
+    with open(TRANSCRIPT_INDEX_PATH, encoding="utf-8") as f:
+        lines = f.readlines()
+    rows = []
+    for line in lines[1:]:
+        line = line.rstrip("\n")
+        if not line:
+            continue
+        parts = line.split("\t")
+        if len(parts) != 5:
+            continue
+        rows.append({"video_id": parts[0], "status": parts[1], "path": parts[2],
+                      "word_count": parts[3], "fetched": parts[4]})
+    return rows
+
+
+def transcript_processed_ids():
+    return {r["video_id"] for r in read_transcript_index_rows()}
+
+
+def append_transcript_index_rows(rows):
+    is_new = not os.path.exists(TRANSCRIPT_INDEX_PATH)
+    with open(TRANSCRIPT_INDEX_PATH, "a", encoding="utf-8") as f:
+        if is_new:
+            f.write(TRANSCRIPT_INDEX_HEADER)
+        for r in rows:
+            f.write(f"{r['video_id']}\t{r['status']}\t{r['path']}\t{r['word_count']}\t{r['fetched']}\n")
+
+
+def transcript_sidecar_path(raw_path):
+    """Same directory and basename as the raw metadata file, swapping
+    .md for .transcript.txt — so a video's metadata and transcript sit
+    next to each other and pair up by filename alone. Kept alongside the
+    in-file section below as the fast-path cache fetch_transcript.py's own
+    dedup logic doesn't need to re-parse a whole .md file to check."""
+    return raw_path[:-3] + ".transcript.txt" if raw_path.endswith(".md") else raw_path + ".transcript.txt"
+
+
+def write_transcript_into_raw_file(raw_path, section_body):
+    """Appends (or replaces, if already present — idempotent) a Transcript
+    section directly onto the raw .md file, right after the description —
+    same subheading, same place, as the wiki source page. Raw/ used to be
+    fetch-only/untouched-after-write; the transcript phase is a deliberate,
+    logged exception to that (2026-08-14, decisions/log.md) — still
+    verbatim source content, just added by a later phase."""
+    with open(raw_path, encoding="utf-8") as f:
+        content = f.read()
+    content = re.sub(rf"\n{re.escape(TRANSCRIPT_HEADING)}\n\n.*", "", content, flags=re.DOTALL)
+    content = content.rstrip("\n") + f"\n\n{TRANSCRIPT_HEADING}\n\n{section_body}\n"
+    with open(raw_path, "w", encoding="utf-8") as f:
+        f.write(content)
+
+
+def find_raw_files_needing_transcript(limit=None):
+    """Same cheap-dedup shape as find_uningested_raw_files: a small index
+    read, not a per-file disk check. Only files whose video_id has a
+    TERMINAL transcript-index entry are skipped — errored/never-attempted
+    videos are included every run."""
+    already = transcript_processed_ids()
+    result = []
+    if not os.path.isdir(RAW_DIR):
+        return result
+    for root, _dirs, files in os.walk(RAW_DIR):
+        for fn in sorted(files):
+            if not fn.endswith(".md") or fn.startswith("_"):
+                continue
+            video_id = fn[11:-3]
+            if video_id in already:
+                continue
+            raw_path = os.path.join(root, fn)
+            fields = parse_raw_file(raw_path)
+            if not fields or "video_id" not in fields:
+                continue
+            result.append((raw_path, fields))
+            if limit and len(result) >= limit:
+                return result
+    return result
+
+
+def cmd_transcript(args):
+    apply_config()
+    sys.path.insert(0, os.path.dirname(__file__))
+    from fetch_transcript import fetch_transcript as fetch_one_transcript
+
+    pending = find_raw_files_needing_transcript(limit=args.limit)
+    if not pending:
+        print(json.dumps({"success": True, "fetched": 0, "note": "Nothing new to transcript-fetch — raw/ is fully caught up."}))
+        return
+
+    fetched_count = 0
+    cached_count = 0
+    unavailable_count = 0
+    error_count = 0
+    index_rows = []
+    fetched_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    for raw_path, fields in pending:
+        video_id = fields["video_id"]
+        result = fetch_one_transcript(video_id)
+        status = result["status"]
+
+        if status in ("ok", "cached"):
+            sidecar = transcript_sidecar_path(raw_path)
+            with open(sidecar, "w", encoding="utf-8") as f:
+                f.write(result["text"])
+            write_transcript_into_raw_file(raw_path, result["text"])
+            index_rows.append({"video_id": video_id, "status": status, "path": sidecar,
+                                "word_count": result["word_count"], "fetched": fetched_at})
+            if status == "ok":
+                fetched_count += 1
+            else:
+                cached_count += 1
+        elif status == "unavailable":
+            write_transcript_into_raw_file(raw_path, TRANSCRIPT_UNAVAILABLE)
+            index_rows.append({"video_id": video_id, "status": "unavailable", "path": "",
+                                "word_count": 0, "fetched": fetched_at})
+            unavailable_count += 1
+        else:  # error — not indexed, retried next run
+            error_count += 1
+
+    if index_rows:
+        append_transcript_index_rows(index_rows)
+
+    total_raw = len(read_raw_index_rows())
+    total_processed = len(transcript_processed_ids())
+    print(json.dumps({
+        "success": True,
+        "fetched": fetched_count,
+        "already_cached": cached_count,
+        "unavailable": unavailable_count,
+        "errors_this_run": error_count,
+        "remaining_untried": max(0, total_raw - total_processed),
+        "note": "Errored videos aren't marked done — re-run `transcript` to retry them." if error_count else None,
+    }))
+
+
+# ---------------------------------------------------------------------------
 # ingest — raw/ -> wiki/sources/, wiki/concepts/, wiki/entities/, index.md,
 # log.md. Lightweight/automated tier: real [[links]], auto-created stub
 # pages, no hand-written synthesis (that's the full manual Brain Matter
@@ -766,7 +964,18 @@ def parse_raw_file(path):
     # 2026-08-11). Split on the first newline instead — unambiguous.
     first_line, _, rest = body.partition("\n")
     fields["title"] = first_line.lstrip("#").strip() or "Untitled"
-    fields["description"] = rest.strip()
+    # The transcript phase may have appended a Transcript section onto this
+    # same raw file (see write_transcript_into_raw_file) — split it off the
+    # description rather than let it get swallowed in as description text.
+    # Real bug, caught in testing 2026-08-14: without this split, a video's
+    # transcript ends up duplicated (once inside "description", once in its
+    # own section) because the appended heading is just more body text as
+    # far as a naive partition is concerned.
+    desc_part, transcript_part = re.split(
+        rf"\n+{re.escape(TRANSCRIPT_HEADING)}\n+", rest, maxsplit=1
+    ) if TRANSCRIPT_HEADING in rest else (rest, None)
+    fields["description"] = desc_part.strip()
+    fields["transcript"] = transcript_part.strip() if transcript_part is not None else None
     return fields
 
 
@@ -849,7 +1058,9 @@ def write_source_page(raw_fields, links):
         f"**Views:** {raw_fields.get('views', 'N/A')} · **Published:** {raw_fields.get('published', '')}\n\n"
         "## Description\n\n"
         f"{render_description_block(raw_fields['description'], url)}\n\n"
-        "## Concepts\n\n"
+        f"{TRANSCRIPT_HEADING}\n\n"
+        + (raw_fields.get("transcript") or "_Not fetched yet — run `transcript` before `ingest` to include this._") + "\n\n"
+        + "## Concepts\n\n"
         + (concept_links + "\n\n" if concept_links else "_None auto-detected._\n\n")
         + "## Entities\n\n"
         + (entity_links + "\n" if entity_links else "_None auto-detected._\n")
@@ -1082,7 +1293,7 @@ def cmd_ingest(args):
     ingested_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     for raw_path, fields in pending:
-        links = generate_links(fields["title"], fields["description"])
+        links = generate_links(fields["title"], fields["description"], fields.get("transcript"))
         source_path = write_source_page(fields, links)
         source_name = page_name(source_path)
         sources_created += 1
@@ -1143,6 +1354,10 @@ def main():
 
     sub.add_parser("refresh", help="Re-fetch metadata for every video already in raw/, in place")
 
+    p_transcript = sub.add_parser("transcript", help="Fetch caption-track transcripts for raw/ videos (sidecar .transcript.txt files)")
+    p_transcript.add_argument("--limit", type=int, default=None,
+                               help="Only attempt the first N videos without a terminal transcript result (for testing before a full run)")
+
     p_ingest = sub.add_parser("ingest", help="Process raw/ into wiki/sources + wiki/concepts + wiki/entities")
     p_ingest.add_argument("--limit", type=int, default=None,
                            help="Only ingest the first N un-ingested raw files (for testing before a full run)")
@@ -1150,7 +1365,8 @@ def main():
     args = parser.parse_args()
     {
         "configure": cmd_configure, "auth": cmd_auth, "test": cmd_test,
-        "fetch": cmd_fetch, "refresh": cmd_refresh, "ingest": cmd_ingest,
+        "fetch": cmd_fetch, "refresh": cmd_refresh, "transcript": cmd_transcript,
+        "ingest": cmd_ingest,
     }[args.command](args)
 
 
