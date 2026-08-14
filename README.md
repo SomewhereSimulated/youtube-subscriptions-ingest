@@ -96,4 +96,8 @@ Email: jeffrey@efficientstreet.com
 YouTube: https://youtube.com/@JeffreyEntrepreneur
 Website: https://efficientstreet.com
 
-**Thanks:** I would like to thank Nate Herk and KJ Rainey for their wonderful classroom videos to help me jump into the world of AI automation and skill building. I would also like to thank their respective Skool communities for their feedback, support and answering my questions. Hopefully, this is the first file of many to come to my GitHub.
+**Thanks:** I would like to thank Nate Herk and KJ Rainey for their wonderful classroom videos to help me jump into the world of AI automation and skill building. I would also like to thank their respective Skool communities for their feedback, support and answering my questions.
+
+Special thanks to Ryan Cunningham for providing the code that powers the transcript-fetch phase, including cache-first logic, retry behavior with backoff, and graceful handling of unavailable captions.
+
+Hopefully, this is the first file of many to come to my GitHub.
